@@ -9,181 +9,173 @@ function shuffle(a) { const b = [...a]; for (let i = b.length - 1; i > 0; i--) {
 export default function Cards({ store, go, level }) {
   const { data } = store;
   
-  // Parse level: can be a number (global level) or an object { islandIdx, difficulty }
   const isIslandMode = typeof level === 'object' && level !== null;
   const islandIdx = isIslandMode ? level.islandIdx : null;
   const difficulty = isIslandMode ? level.difficulty : null;
 
-  const [allCards, setAllCards] = useState([]);
-  const [idx, setIdx] = useState(0);
-  const [step, setStep] = useState(1); // 1, 2, or 3
-  const [flipped, setFlipped] = useState(false); // only for type: "word"
-  const [choiceState, setChoiceState] = useState(null); // { selectedId, correctId, isCorrect, showFeedback }
+  const [cards, setCards] = useState([]); // Base card data
+  const [queue, setQueue] = useState([]); // [{ cardIdx, step }]
+  const [qIdx, setQIdx] = useState(0); // Current position in queue
+  const [flipped, setFlipped] = useState(false);
+  const [choiceState, setChoiceState] = useState(null);
   const [sessionResults, setSessionResults] = useState(null);
-  const [shake, setShake] = useState(false); // For incorrect answers
+  const [shake, setShake] = useState(false);
 
-  // Initialize cards
+  // --- INITIALIZATION ---
   useEffect(() => {
-    let filtered = [];
+    let baseCards = [];
     if (isIslandMode) {
       const island = islands[islandIdx];
       const items = island.items.filter(i => !difficulty || i.difficulty === difficulty);
-      // Find global indices for tracking
-      filtered = items.map(item => {
+      baseCards = items.map(item => {
         const globalIdx = allWords.findIndex(w => w.en === item.en && w.ru === item.ru);
         return { word: item, globalIdx };
       });
     } else {
-      // Classic mode
       const WORDS_PER_LEVEL = 10;
       const base = level * WORDS_PER_LEVEL;
       const words = allWords.slice(base, base + WORDS_PER_LEVEL);
-      filtered = words.map((w, i) => ({ word: w, globalIdx: base + i }));
+      baseCards = words.map((w, i) => ({ word: w, globalIdx: base + i }));
     }
 
-    if (filtered.length === 0) {
+    if (baseCards.length === 0) {
       go('levels');
       return;
     }
     
-    setAllCards(filtered);
-    setIdx(0);
-    setStep(1);
+    setCards(baseCards);
+
+    // Build Session Queue: Phase-based
+    // Phase 1: Intro for ALL
+    const phase1 = baseCards.map((_, i) => ({ cardIdx: i, step: 1 }));
+    
+    // Phase 2: Recall for Phrases (Shuffled)
+    const phraseIndices = baseCards.map((c, i) => c.word.type === 'phrase' || c.word.type === 'glue' ? i : -1).filter(i => i !== -1);
+    const phase2 = shuffle(phraseIndices).map(i => ({ cardIdx: i, step: 2 }));
+    
+    // Phase 3: Mastery for Phrases (Shuffled)
+    const phase3 = shuffle(phraseIndices).map(i => ({ cardIdx: i, step: 3 }));
+
+    setQueue([...phase1, ...phase2, ...phase3]);
+    setQIdx(0);
+    setFlipped(false);
+    
+    if (!isIslandMode) store.touchLevel(level);
   }, [level, islandIdx, difficulty]);
 
-  const current = allCards[idx];
-  const isPhrase = current ? (current.word.type === 'phrase' || current.word.type === 'glue') : false;
+  const currentTask = queue[qIdx];
+  const currentCard = currentTask ? cards[currentTask.cardIdx] : null;
 
-  // --- STEP GENERATORS (Memoized) ---
-  // Hooks MUST be called before any early returns
-
+  // --- STEP OPS ---
   const step2Options = useMemo(() => {
-    if (!current || !isPhrase || step !== 2) return [];
-    const word = current.word;
-    const islandItems = getIslandItems(word.island).filter(i => i.type === 'word');
-    const pool = islandItems.length >= 3 ? islandItems : allWords.filter(w => w.type === 'word');
-    const alternatives = shuffle(pool).slice(0, 3).map(i => i.en);
-    return shuffle([word.en, ...alternatives]);
-  }, [idx, step, allCards.length]);
+    if (!currentCard || currentTask?.step !== 2) return [];
+    return shuffle([currentCard.word.en, ...getSimilarWords(currentCard.globalIdx, 3, currentCard.word.en, 'en')]);
+  }, [qIdx, queue.length]);
 
   const step3Options = useMemo(() => {
-    if (!current || !isPhrase || step !== 3) return [];
-    const word = current.word;
-    const wrong = getSimilarWords(current.globalIdx, 2, word.ru);
-    return shuffle([{ text: word.ru, correct: true }, ...wrong.map(w => ({ text: w, correct: false }))]);
-  }, [idx, step, allCards.length]);
+    if (!currentCard || currentTask?.step !== 3) return [];
+    const wrong = getSimilarWords(currentCard.globalIdx, 2, currentCard.word.en, 'en');
+    return shuffle([{ text: currentCard.word.en, correct: true }, ...wrong.map(w => ({ text: w, correct: false }))]);
+  }, [qIdx, queue.length]);
 
-  if (!current) return null;
+  if (!currentCard || !currentTask) return null;
 
-  const word = current.word;
+  const { word, globalIdx } = currentCard;
+  const { step } = currentTask;
   const meta = islandMetadata[word.island] || { creative: word.island, icon: word.islandIcon || '🏝️' };
-
-  // --- LOGIC FOR STEPS ---
+  const isPhrase = word.type === 'phrase' || word.type === 'glue';
 
   const handleNext = (isCorrect = true) => {
-    if (!isPhrase) {
-      store.markSeen(current.globalIdx);
-      moveToNextCard();
-    } else {
-      if (isCorrect) {
-        sfx.success();
-        if (step < 3) {
-          setStep(step + 1);
-          setChoiceState(null);
-        } else {
-          store.markSeen(current.globalIdx);
-          store.update(p => ({ ...p, xp: p.xp + 5 }));
-          moveToNextCard();
-        }
-      } else {
-        sfx.error();
-        setShake(true);
-        setTimeout(() => setShake(false), 500); // Reset shake after animation
-      }
+    if (!isCorrect) {
+      sfx.error();
+      setShake(true);
+      setTimeout(() => setShake(false), 500);
+      return;
     }
-  };
 
-  const moveToNextCard = () => {
-    if (idx + 1 >= allCards.length) {
-      setSessionResults({ xp: allCards.length * 5, count: allCards.length });
-      confetti({
-        particleCount: 100,
-        spread: 70,
-        origin: { y: 0.6 }
-      });
+    sfx.success();
+    // Mark global seen if it's the last step for this card or phase 1
+    try {
+      if (step === 3 || !isPhrase) {
+        if (store && store.markSeen) store.markSeen(globalIdx);
+        if (store && store.update) store.update(p => ({ ...p, xp: p.xp + (isPhrase ? 5 : 2) }));
+      }
+    } catch (err) {
+      console.warn("Store update failed", err);
+    }
+
+    if (qIdx + 1 >= queue.length) {
+      setSessionResults({ xp: cards.length * 15, count: cards.length }); 
+      confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
     } else {
-      setIdx(idx + 1);
-      setStep(1);
+      setQIdx(qIdx + 1);
       setFlipped(false);
       setChoiceState(null);
     }
   };
 
-  // --- RENDER HELPERS ---
+  const progressPct = (qIdx / queue.length) * 100;
 
   if (sessionResults) {
     return (
       <div style={S.page} className="anim-in">
         <div style={S.doneContainer}>
           <div style={{ fontSize: 64 }}>🎉</div>
-          <h2 style={S.doneTitle}>Отлично!</h2>
-          <p style={S.dim}>Вы изучили {sessionResults.count} элементов</p>
+          <h2 style={S.doneTitle}>Урок завершен!</h2>
+          <p style={S.dim}>Ты прошел все фазы обучения для {sessionResults.count} фраз</p>
           <div style={S.xpBadge}>+{sessionResults.xp} XP</div>
-          <button className="btn-primary" style={{ width: '100%', marginTop: 20 }} onClick={() => go('levels')}>К островам</button>
+          
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%', marginTop: 24 }}>
+            {!isIslandMode ? (
+              <button className="btn-primary" style={{ width: '100%' }} onClick={() => go('quiz', { level, type: 'normal' })}>
+                Пройти тест ⚡
+              </button>
+            ) : (
+              <button className="btn-primary" style={{ width: '100%' }} onClick={() => go('islandView', islandIdx)}>
+                Назад к острову 🏝️
+              </button>
+            )}
+            <button className="btn-ghost" style={{ width: '100%' }} onClick={() => go('home')}>
+              На главную 🏠
+            </button>
+          </div>
         </div>
       </div>
     );
   }
 
-  const progressPct = ((idx + (isPhrase ? (step - 1) / 3 : 0)) / allCards.length) * 100;
-
   return (
     <div style={S.page} className="anim-in">
-      {/* Header */}
       <div className="app-header">
-        <button className="back-btn-round" onClick={() => go('islandView', islandIdx)}>✕</button>
+        <button className="back-btn-round" onClick={() => (islandIdx !== null ? go('islandView', islandIdx) : go('home'))}>✕</button>
         <div className="header-title" style={{ textAlign: 'center' }}>
-          <span style={{ opacity: 0.6, fontSize: 12 }}>{meta.creative}</span>
-          <div style={{ fontSize: 14, fontWeight: 800 }}>{idx + 1} из {allCards.length}</div>
+          <span style={{ opacity: 0.6, fontSize: 10, textTransform: 'uppercase', letterSpacing: 1 }}>
+            {step === 1 ? 'Фаза 1: Знакомство' : step === 2 ? 'Фаза 2: Припоминание' : 'Фаза 3: Мастерство'}
+          </span>
+          <div style={{ fontSize: 14, fontWeight: 800 }}>Шаг {qIdx + 1} из {queue.length}</div>
         </div>
-        <div style={{ width: 40 }} /> {/* Spacer */}
+        <div style={{ width: 40 }} />
       </div>
 
-      {/* Progress Bar */}
       <div style={S.bar}>
         <div style={{ ...S.barIn, width: `${progressPct}%` }} />
       </div>
 
-      {/* Step Indicator (for phrases) */}
-      {isPhrase && (
-        <div className="step-indicator">
-          {[1, 2, 3].map(s => (
-            <div key={s} className={`step-dot ${s <= step ? 'active' : ''}`} />
-          ))}
-        </div>
-      )}
-
-      {/* Main Content Area */}
       <div style={S.content}>
         {!isPhrase ? (
-          <StandardCard word={word} flipped={flipped} onFlip={() => { setFlipped(!flipped); tts.speak(word.en); }} />
+          <StandardCard key={`word-${qIdx}`} word={word} flipped={flipped} onFlip={() => { setFlipped(!flipped); tts.speak(word.en); }} />
         ) : (
           <div className="phrase-step-container">
-            {step === 1 && <Step1Intro word={word} meta={meta} onNext={handleNext} />}
-            {step === 2 && <Step2Substitution word={word} options={step2Options} onCorrect={handleNext} />}
-            {step === 3 && <Step3Reaction word={word} options={step3Options} onComplete={handleNext} />}
+            {step === 1 && <Step1Intro key={`s1-${qIdx}`} word={word} meta={meta} flipped={flipped} onFlip={() => { setFlipped(!flipped); tts.speak(word.en); }} />}
+            {step === 2 && <Step2Recall key={`s2-${qIdx}`} word={word} options={step2Options} onCorrect={handleNext} />}
+            {step === 3 && <Step3Reaction key={`s3-${qIdx}`} word={word} options={step3Options} onComplete={handleNext} />}
           </div>
         )}
       </div>
 
-      {/* Footer Controls (only for step 1 or words) */}
       {(step === 1 || !isPhrase) && (
         <div className="btn-row" style={{ marginTop: 'auto', paddingBottom: 20 }}>
-          {!isPhrase ? (
-            <button className="btn-primary btn-flex" onClick={handleNext}>Далее →</button>
-          ) : (
-            <button className="btn-primary btn-flex" onClick={handleNext}>Понятно →</button>
-          )}
+          <button className="btn-primary btn-flex" onClick={handleNext}>Понятно →</button>
         </div>
       )}
     </div>
@@ -213,7 +205,7 @@ function StandardCard({ word, flipped, onFlip }) {
   );
 }
 
-function Step1Intro({ word, meta, onNext }) {
+function Step1Intro({ word, meta, flipped, onFlip }) {
   // Generate simple dialogue if example is missing
   const dialogue = word.example ? word.example.split('\n') : [
     `— How are you?`,
@@ -223,13 +215,23 @@ function Step1Intro({ word, meta, onNext }) {
 
   return (
     <div className="anim-in">
-      <div className="glass-card" style={S.introCard}>
-        <div style={S.contextBadge}>{word.context || meta.creative}</div>
-        <div style={S.phraseText}>{word.en}</div>
-        <div style={S.translationSmall}>{word.ru}</div>
-        <div style={S.hintItalic}>{word.hint}</div>
-        <button className="tts-btn" onClick={() => tts.speak(word.en)}>🔊 Слушать</button>
+      <div style={S.cardArea} onClick={onFlip}>
+        <div style={{ ...S.cardWrap, height: 260, transform: flipped ? 'rotateY(180deg)' : 'rotateY(0)' }}>
+          <div className="glass-card" style={{ ...S.face, ...S.front, padding: 24 }}>
+            <div style={S.contextBadge}>{word.context || meta.creative}</div>
+            <div style={{ fontSize: 13, opacity: 0.6, marginTop: 20 }}>Как сказать по-английски:</div>
+            <div style={{ ...S.translation, fontSize: 24, margin: '10px 0' }}>{word.ru}</div>
+            <div style={S.tap}>нажми чтобы узнать ответ</div>
+          </div>
+          <div className="glass-card" style={{ ...S.face, ...S.back, padding: 24 }}>
+            <div style={S.badge}>ОТВЕТ</div>
+            <div style={{ ...S.phraseText, color: 'var(--accent)', marginBottom: 8 }}>{word.en}</div>
+            {word.hint && <div style={S.hintItalic}>{word.hint}</div>}
+            <div style={{ marginTop: 'auto', fontSize: 11, opacity: 0.5 }}>🔊 Озвучено</div>
+          </div>
+        </div>
       </div>
+
 
       <div className="bubble-container">
         {dialogue.map((line, i) => {
@@ -251,25 +253,30 @@ function Step1Intro({ word, meta, onNext }) {
   );
 }
 
-function Step2Substitution({ word, options, onCorrect }) {
+function Step2Recall({ word, options, onCorrect }) {
   const [selected, setSelected] = useState(null);
   
   const handleSelect = (opt) => {
     setSelected(opt);
     tts.speak(opt);
-    setTimeout(onCorrect, 1000);
+    if (opt === word.en) {
+      setTimeout(onCorrect, 1000);
+    } else {
+      sfx.error();
+      setTimeout(() => setSelected(null), 800);
+    }
   };
 
   return (
     <div className="anim-in">
       <div style={{ textAlign: 'center', marginBottom: 30 }}>
-        <h3 style={{ fontSize: 18, fontWeight: 800 }}>Как еще можно сказать?</h3>
-        <p style={S.dim}>Фразы гибкие — попробуй другие варианты</p>
+        <h3 style={{ fontSize: 18, fontWeight: 800 }}>Как это по-английски?</h3>
+        <p style={S.dim}>Вспомни перевод фразы:</p>
       </div>
 
       <div className="glass-card" style={S.substitutionCard}>
-        <div style={{ fontSize: 24, fontWeight: 800, color: 'var(--accent)' }}>
-          {selected || '...'}
+        <div style={{ fontSize: 20, fontWeight: 800, color: 'var(--text)' }}>
+          {word.ru}
         </div>
       </div>
 
@@ -277,12 +284,11 @@ function Step2Substitution({ word, options, onCorrect }) {
         {options.map((opt, i) => (
           <button 
             key={i} 
-            className="glass-card choice-btn" 
+            className={`glass-card choice-btn ${selected === opt ? (opt === word.en ? 'correct-flash' : 'shake wrong-flash') : ''}`}
             style={{ 
-              ...(selected === opt ? S.selectedChoice : {}),
               fontWeight: 800,
               fontSize: '15px',
-              color: selected === opt ? '#000' : 'var(--text)'
+              color: 'var(--text)'
             }}
             onClick={() => handleSelect(opt)}
           >
@@ -299,13 +305,18 @@ function Step3Reaction({ word, options, onComplete }) {
 
   const prompt = useMemo(() => {
     const ctx = word.context?.toLowerCase() || '';
+    const en = word.en?.toLowerCase() || '';
+    
     if (ctx.includes('представит')) return 'Nice to meet you! Who are you?';
     if (ctx.includes('привет') || ctx.includes('начать')) return 'Hey! How are things?';
     if (ctx.includes('прощ')) return 'Great talking to you! See you!';
-    if (ctx.includes('ответить')) return 'How are you today?';
-    if (ctx.includes('узнать')) return 'I have a question for you...';
+    if (ctx.includes('спасибо') || ctx.includes('поблагод') || en.includes('welcome')) return 'Thank you so much for your help!';
+    if (ctx.includes('извин') || en.includes('sorry')) return 'Oh, I am so sorry about that!';
+    if (ctx.includes('помощь') || en.includes('help')) return 'Can you help me with this?';
+    if (ctx.includes('самочув') || en.includes('well') || en.includes('fine')) return 'How are you feeling today?';
+    if (ctx.includes('поздрав')) return 'I have some great news! I got the job!';
     return '...';
-  }, [word.context]);
+  }, [word.context, word.en]);
 
   const handleChoice = (opt) => {
     if (feedback) return;
@@ -326,7 +337,7 @@ function Step3Reaction({ word, options, onComplete }) {
 
       <div className="bubble-container">
         <div className="bubble bubble-left">
-          Ситуация: {word.context || 'Разговор'}
+          <span style={{opacity: 0.6, fontSize: 12}}>Ситуация: {word.context || 'Разговор'}</span>
           <br/>
           <strong>— {prompt}</strong>
         </div>
